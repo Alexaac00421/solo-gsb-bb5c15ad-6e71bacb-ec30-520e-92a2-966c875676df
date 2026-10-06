@@ -205,3 +205,6 @@ tr.cancelled-row td > * { opacity: .8; }
 }
 .adj-table .eq-checks { display: flex; flex-wrap: wrap; gap: 2px 10px; min-width: 150px; }
 .adj-table .eq-checks .check { font-size: 13px; white-space: nowrap; }
+
+/* 清洁补救试算 */
+.remedy-sub { margin: 18px 0 8px; font-size: 15px; }

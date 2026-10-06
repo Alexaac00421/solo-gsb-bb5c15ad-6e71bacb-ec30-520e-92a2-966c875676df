@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}补救试算结果 · 清洁补救 · 共享厨房过敏原排程{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>清洁补救试算结果（未写入任何数据）</h2>
+  <p class="hint">目标批次：<strong>{{ target.name }}</strong>
+    <span class="muted">#{{ target.id }}</span>
+    · 器具：{{ target.equipment_names|join('、') if target.equipment_names else '—' }}
+    · 时段：{% if target.start %}{{ target.start.strftime('%m-%d %H:%M') }} ~
+    {{ target.end.strftime('%H:%M') }}{% else %}—{% endif %}
+    · 输入清洁时长：<strong>{{ minutes }} 分钟</strong>。
+    本页仅为试算结果，<b>未写入</b>清洁记录、实时排程与交接版。</p>
+
+  {% if verdict == 'unnecessary' %}
+  <div class="flash ok">✅ 该批次当前已排入，无需清洁补救。</div>
+  {% elif verdict == 'solvable' %}
+  <div class="flash ok">✅ 可仅靠清洁解决：按下方建议补登 {{ suggestions|length }} 条清洁后，
+    用虚拟清洁重算，目标批次转为「已排入」。</div>
+  {% else %}
+  <div class="flash error">⛔ 不可仅靠清洁解决该批次的阻塞，请结合时段/器具调整或停用变更处理。</div>
+  {% endif %}
+
+  {% if target.status == 'blocked' %}
+  <h3 class="remedy-sub">目标批次当前阻塞原因</h3>
+  <ul class="reasons">
+    {% for b in target.blocks %}<li class="block">⛔ {{ b }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if suggestions %}
+  <h3 class="remedy-sub">逐台器具的最晚清洁时窗与建议清洁</h3>
+  <table>
+    <thead>
+      <tr><th>器具</th><th>须全部覆盖的新增残留过敏原</th><th>最晚可执行时窗</th>
+        <th>建议清洁时间（完成）</th><th>建议有效至</th><th>建议覆盖范围</th><th>结论</th></tr>
+    </thead>
+    <tbody>
+    {% for s in suggestions %}
+      <tr>
+        <td><strong>{{ s.equipment }}</strong><br>
+          <span class="muted">残留来自批次「{{ s.from_batch }}」</span></td>
+        <td>{{ join_alg(s.new_risks) }}</td>
+        <td class="time">
+          {% if s.window %}{{ s.window[0].strftime('%m-%d %H:%M') }} ~
+          {{ s.window[1].strftime('%H:%M') }}{% else %}—{% endif %}
+        </td>
+        <td class="time">
+          {% if s.cleaned_at %}{{ s.cleaned_at.strftime('%m-%d %H:%M') }}{% else %}—{% endif %}
+        </td>
+        <td class="time">{{ s.valid_until.strftime('%m-%d %H:%M') }}</td>
+        <td>{{ s.covers.replace(',', '、') }}</td>
+        <td>
+          {% if s.window %}<span class="badge ok">可安排 {{ s.minutes }} 分钟</span>
+          {% else %}<span class="badge bad">无足够时窗</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if other_blocks %}
+  <h3 class="remedy-sub">与清洁无关的阻塞原因（补登清洁无法解决）</h3>
+  <ul class="reasons">
+    {% for b in other_blocks %}<li class="block">⛔ {{ b }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if rows is not none %}
+  <h3 class="remedy-sub">用虚拟清洁重算的完整排程
+    （{{ trial_accepted }} 排入 / {{ trial_blocked }} 阻塞）</h3>
+  <table class="schedule">
+    <thead>
+      <tr><th>顺序</th><th>批次 / 过敏原</th><th>当前（实时排程）</th>
+        <th>试算后（含虚拟清洁）</th><th>变化</th></tr>
+    </thead>
+    <tbody>
+    {% for row in rows %}
+      {% set b = row.before %}{% set t = row.after %}
+      <tr class="{{ t.status }}">
+        <td>{{ loop.index }}</td>
+        <td>
+          <strong>{{ t.name }}</strong> <span class="muted">#{{ t.id }}</span>
+          {% if row.is_target %}<span class="badge add">目标批次</span>{% endif %}<br>
+          <span class="tags">
+            {% for a in t.allergens %}<span class="tag">{{ a }}</span>
+            {% else %}<span class="tag none">无过敏原</span>{% endfor %}
+          </span>
+        </td>
+        <td>
+          {% if b.status == 'accepted' %}<span class="badge ok">已排入</span>
+          {% else %}<span class="badge bad">已拒绝</span>{% endif %}
+          {% if b.blocks %}
+          <ul class="reasons">
+            {% for reason in b.blocks %}<li class="block">⛔ {{ reason }}</li>{% endfor %}
+          </ul>
+          {% endif %}
+        </td>
+        <td class="risks">
+          {% if t.status == 'accepted' %}<span class="badge ok">已排入</span>
+          {% else %}<span class="badge bad">已拒绝</span>{% endif %}
+          {% if t.status == 'blocked' %}
+          <ul class="reasons">
+            {% for reason in t.blocks %}<li class="block">⛔ {{ reason }}</li>{% endfor %}
+          </ul>
+          {% endif %}
+          {% set shown = t.risks|selectattr('level', 'ne', 'blocked')|list if t.status == 'blocked' else t.risks %}
+          {% if shown %}
+          <ul class="reasons">
+            {% for risk in shown %}
+            <li class="{{ risk.level }}">
+              {{ risk_source_text(risk) }}<br>
+              <span class="action">
+                {% if risk.level == 'none' %}✅{% elif risk.level == 'mitigated' %}🧼{% else %}⚠️{% endif %}
+                {{ risk_action_text(risk) }}
+              </span>
+            </li>
+            {% endfor %}
+          </ul>
+          {% elif t.status == 'accepted' %}
+          <span class="muted">无前置残留风险（首用器具或器具空闲）</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if row.changes %}
+          <ul class="change-list">
+            {% for c in row.changes %}<li>{{ c }}</li>{% endfor %}
+          </ul>
+          {% else %}<span class="muted">无变化</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <div class="form-actions" style="margin-top:14px;">
+    {% if verdict == 'solvable' %}
+    <a class="btn" href="{{ url_for('equipment_page') }}">🧼 前往「器具与清洁」按建议登记清洁</a>
+    {% endif %}
+    <a class="btn ghost" href="{{ url_for('cleaning_remedy_page') }}">↩ 重新选择批次 / 时长</a>
+    <a class="btn ghost" href="{{ url_for('index') }}">返回看板</a>
+  </div>
+</section>
+{% endblock %}

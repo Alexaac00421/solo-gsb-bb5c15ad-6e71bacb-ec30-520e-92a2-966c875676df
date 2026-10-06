@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}清洁补救试算 · 共享厨房过敏原排程{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>清洁补救试算</h2>
+  <p class="hint">针对当前排程中<b>因清洁缺失、失效或覆盖不足而受阻</b>的批次：选择批次并输入
+    清洁所需的<b>正整数分钟数</b>，系统按现有排入顺序与器具占用、停用时段，逐台找出
+    前一已排入批次结束至目标开始之间可连续执行清洁的<b>最晚时窗</b>，给出建议的单条清洁
+    （覆盖该器具全部新增残留过敏原，完成时间作为清洁时间，有效期至少覆盖目标开始），
+    并用虚拟清洁<b>重算完整排程</b>，展示目标及其他批次的状态/原因变化。
+    任一相关器具无足够时窗，或目标还因占用、停用等原因受阻时，即判定<b>不可仅靠清洁解决</b>。
+    <b>试算不写入清洁记录、实时排程与交接版</b>；确认可行后请到
+    <a href="{{ url_for('equipment_page') }}">器具与清洁</a> 按建议自行登记清洁记录。</p>
+  {% if not results %}
+  <p class="empty">还没有批次，请先到 <a href="{{ url_for('batches') }}">批次管理</a> 录入。</p>
+  {% else %}
+  <form method="post" action="{{ url_for('cleaning_remedy_preview') }}" class="grid-form">
+    <label>目标批次（选项中标注当前状态）
+      <select name="batch_id" required>
+        {% for r in results %}
+        <option value="{{ r.id }}" {% if prefill_batch == r.id %}selected{% endif %}>
+          #{{ r.id }} {{ r.name }} — {{ '已排入' if r.status == 'accepted' else '已拒绝' }}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>清洁所需时长（分钟，正整数）
+      <input type="number" name="minutes" min="1" step="1" required
+             value="{{ prefill_minutes if prefill_minutes else 30 }}">
+    </label>
+    <div class="form-actions">
+      <button class="btn" type="submit">🧼 查看补救试算</button>
+      <a class="btn ghost" href="{{ url_for('index') }}">返回看板</a>
+    </div>
+  </form>
+  {% set blocked = results|selectattr('status', 'eq', 'blocked')|list %}
+  {% if blocked %}
+  <h3 class="remedy-sub">当前受阻批次</h3>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>批次</th><th>器具</th><th>预计时段</th><th>阻塞原因</th><th>试算</th></tr>
+    </thead>
+    <tbody>
+    {% for r in blocked %}
+      <tr class="blocked">
+        <td>{{ r.id }}</td>
+        <td><strong>{{ r.name }}</strong></td>
+        <td>{{ r.equipment_names|join('、') if r.equipment_names else '—' }}</td>
+        <td class="time">
+          {% if r.start %}{{ r.start.strftime('%m-%d %H:%M') }} ~ {{ r.end.strftime('%H:%M') }}{% else %}—{% endif %}
+        </td>
+        <td>
+          <ul class="reasons">
+            {% for b in r.blocks %}<li class="block">⛔ {{ b }}</li>{% endfor %}
+          </ul>
+        </td>
+        <td><a class="btn small ghost"
+               href="{{ url_for('cleaning_remedy_page', batch_id=r.id) }}">选择</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% endif %}
+</section>
+{% endblock %}
