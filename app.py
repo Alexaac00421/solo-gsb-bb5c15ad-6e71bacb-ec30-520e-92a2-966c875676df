@@ -19,6 +19,14 @@
    实时排程、导出与交接版。确认时若排程依据（批次/器具/清洁/停用/配方）自
    试算后已变化，拒绝过期方案并提示重新试算；否则在同一事务内一次性保存
    全部调整（失败不部分写入），含阻塞批次的方案允许保存，交接版发布规则不变。
+6. 清洁补救试算：对当前因清洁缺失/失效/覆盖不足受阻的批次，排程员选择批次
+   并输入正整数分钟的清洁时长，系统逐台找出“前一已排入批次结束 → 目标开始”
+   区间内扣除停用与占用后、可连续执行清洁的最晚时窗（端点相接不算占用）；
+   建议的单条清洁覆盖该器具全部新增残留过敏原，完成时间作为清洁时间，有效期
+   覆盖目标开始。任一相关器具时窗不足，或目标还因占用/停用受阻，或加入虚拟
+   清洁重算后目标仍阻塞，均判定不可仅靠清洁解决。试算只用虚拟清洁在内存中
+   重算完整排程（含其他批次的级联变化），不写入清洁、实时排程或交接版；
+   无效批次与非正整数时长一律拒绝。
 """
 import csv
 import hashlib
@@ -26,7 +34,7 @@ import io
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import (Flask, Response, flash, g, redirect, render_template,
                    request, url_for)
@@ -256,6 +264,20 @@ def revision_note_text(rev):
             f"原因：{rev['reason']}")
 
 
+def trial_risk_action_text(risk):
+    """清洁补救试算结果中风险处置的展示文案（识别只存在于试算中的虚拟清洁）。"""
+    if risk["level"] != "mitigated":
+        return risk_action_text(risk)
+    c = risk["cleaning"]
+    if not c.get("virtual"):
+        return risk_action_text(risk)
+    covers = cleaning_cover_text(c.get("covers"))
+    return (f"新增风险 {join_alg(risk['new_risks'])}，可由本试算建议的虚拟清洁覆盖"
+            f"（{fmt_dt_min(c['cleaned_at'])} 完成清洁，有效期至 "
+            f"{fmt_dt_min(c['valid_until'])}，范围：{covers}）；"
+            f"该清洁仅存在于本次试算，未写入系统")
+
+
 # ---------------------------------------------------------------- 排程引擎
 
 def active_downtimes(conn):
@@ -279,7 +301,8 @@ def active_downtimes(conn):
     return downtimes
 
 
-def compute_schedule(conn, exclude_cleaning_id=None, batch_rows=None, equip_of=None):
+def compute_schedule(conn, exclude_cleaning_id=None, batch_rows=None,
+                     equip_of=None, virtual_cleanings=None):
     """按当前顺序（seq, 计划开始时间）逐个尝试排入，返回每批次的结果。
 
     exclude_cleaning_id 给出的清洁记录在本次计算中视为不存在（规则本身不变），
@@ -287,6 +310,9 @@ def compute_schedule(conn, exclude_cleaning_id=None, batch_rows=None, equip_of=N
     batch_rows / equip_of 给出时，用其代替数据库中的批次与器具关联进行计算
     （清洁、停用、器具主数据仍取自数据库当前值），用于批量调整试算，
     不改动任何已存数据。
+    virtual_cleanings 给出时，追加若干只存在于本次计算中的“虚拟清洁”
+    （字典含 equipment_id/cleaned_at/valid_until/covers/virtual=True），
+    数据库不做任何写入；用于清洁补救试算。
     """
     eq_names = {r["id"]: r["name"] for r in conn.execute("SELECT * FROM equipment")}
     if equip_of is None:
@@ -302,6 +328,17 @@ def compute_schedule(conn, exclude_cleaning_id=None, batch_rows=None, equip_of=N
         c["cleaned_dt"] = parse_dt(c["cleaned_at"])
         c["valid_dt"] = parse_dt(c["valid_until"])
         cleanings.setdefault(c["equipment_id"], []).append(c)
+    for c in virtual_cleanings or []:
+        c = dict(c)
+        c.setdefault("id", None)
+        c.setdefault("virtual", True)
+        c["cleaned_dt"] = parse_dt(c["cleaned_at"])
+        c["valid_dt"] = parse_dt(c["valid_until"])
+        cleanings.setdefault(c["equipment_id"], []).append(c)
+    # 追加虚拟清洁后各器具内需重新按清洁时间排序（无 id 的虚拟记录用 id=0 兜底）
+    for eq_id in cleanings:
+        cleanings[eq_id].sort(
+            key=lambda c: (c["cleaned_dt"] or datetime.min, c["id"] or 0))
     latest_rev = latest_revisions(conn)
 
     usage = {}  # equipment_id -> [已排入批次的占用记录]
@@ -352,7 +389,9 @@ def compute_schedule(conn, exclude_cleaning_id=None, batch_rows=None, equip_of=N
                 prev = max(prevs, key=lambda u: u["end"])
                 residual = sorted(prev["allergens"])
                 new_risks = sorted(prev["allergens"] - b_allergens)
-                risk = {"equipment": eq_name, "from_batch": prev["batch_name"],
+                risk = {"equipment": eq_name, "equipment_id": eq,
+                        "from_batch": prev["batch_name"],
+                        "prev_end": prev["end"],
                         "residual": residual, "new_risks": new_risks,
                         "cleaning": None, "level": "none", "block_reason": None}
                 if not new_risks:
@@ -547,6 +586,7 @@ def inject_globals():
     return {"app_url": APP_URL, "port": PORT, "allergen_options": ALLERGENS,
             "risk_source_text": risk_source_text,
             "risk_action_text": risk_action_text,
+            "trial_risk_action_text": trial_risk_action_text,
             "revision_note_text": revision_note_text,
             "join_alg": join_alg}
 
@@ -1137,6 +1177,304 @@ def reschedule_confirm():
         msg += "；含阻塞批次的方案已照常保存，发布交接版仍要求全部批次可排入"
     flash(msg, "ok")
     return redirect(url_for("index"))
+
+
+# ---------------------------------------------------------- 清洁补救试算
+
+def cleaning_blocked_targets(results):
+    """当前因清洁缺失 / 失效 / 覆盖不足而受阻的批次（补救试算的可选目标）。
+
+    返回 {batch_id: {"row": 排程结果, "risks": [清洁类风险]}}；
+    只有 blocked 且至少一条风险为 blocked 级的批次才可选——
+    占用冲突、器具停用等非清洁原因造成的阻塞不在候选内。
+    """
+    targets = {}
+    for r in results:
+        if r["status"] != "blocked":
+            continue
+        risks = [risk for risk in r["risks"] if risk["level"] == "blocked"]
+        if risks:
+            targets[r["id"]] = {"row": r, "risks": risks}
+    return targets
+
+
+def accepted_usage(conn, results):
+    """按当前排程结果重建各器具上“已排入”批次的占用记录，供时窗扣除使用。
+
+    被阻塞批次不占用器具，因此只取 accepted 批次；
+    每项含起止、批次名与过敏原集合，结构与 compute_schedule 内部 usage 一致。
+    """
+    accepted = {r["id"] for r in results if r["status"] == "accepted"}
+    usage = {}
+    rows = conn.execute(
+        "SELECT b.id AS bid, b.name AS name, b.allergens AS allergens,"
+        " b.planned_start AS planned_start, b.planned_end AS planned_end,"
+        " be.equipment_id AS equipment_id FROM batch b"
+        " JOIN batch_equipment be ON be.batch_id = b.id").fetchall()
+    for r in rows:
+        if r["bid"] not in accepted:
+            continue
+        start, end = parse_dt(r["planned_start"]), parse_dt(r["planned_end"])
+        if start is None or end is None:
+            continue
+        usage.setdefault(r["equipment_id"], []).append({
+            "start": start, "end": end, "batch_name": r["name"],
+            "allergens": split_allergens(r["allergens"])})
+    return usage
+
+
+def free_segments_between(horizon_start, horizon_end, downtimes, usages):
+    """计算开区间 (horizon_start, horizon_end) 扣除停用与占用后的连续空闲段。
+
+    端点相接不算相交（与排程规则一致）：阻挡区间只在与开区间严格相交时扣除。
+    返回 (blockers, segments)：
+    - blockers：相交的阻挡区间，按开始时间排序，每项含 kind/start/end/label；
+    - segments：扣除后剩余的空闲时段 [(start, end) ...]，按开始时间升序；
+      阻挡区间两两重叠时做防御性合并，保证空闲段计算正确。
+    """
+    blockers = []
+    for d in downtimes or []:
+        if d["start_dt"] < horizon_end and horizon_start < d["end_dt"]:
+            blockers.append({
+                "kind": "downtime", "start": d["start_dt"], "end": d["end_dt"],
+                "label": downtime_block_text(
+                    d["equipment_name"], d["start_dt"], d["end_dt"],
+                    d.get("reason") or "—")})
+    for u in usages or []:
+        if u["start"] < horizon_end and horizon_start < u["end"]:
+            blockers.append({
+                "kind": "usage", "start": u["start"], "end": u["end"],
+                "label": (f"已排入批次「{u['batch_name']}」占用"
+                          f"（{fmt_dt_min(u['start'])} ~ "
+                          f"{fmt_dt_min(u['end'])}），清洁不得与生产重叠")})
+    blockers.sort(key=lambda b: (b["start"], b["end"]))
+    # 合并相互重叠的阻挡区间
+    merged = []
+    for b in blockers:
+        if merged and b["start"] <= merged[-1]["end"]:
+            if b["end"] > merged[-1]["end"]:
+                merged[-1]["end"] = b["end"]
+                merged[-1]["label"] += "；" + b["label"]
+        else:
+            merged.append(dict(b))
+    segments = [(horizon_start, horizon_end)]
+    for b in merged:
+        rest = []
+        for seg_start, seg_end in segments:
+            if b["end"] <= seg_start or b["start"] >= seg_end:
+                rest.append((seg_start, seg_end))  # 不相交
+                continue
+            if seg_start < b["start"]:
+                rest.append((seg_start, b["start"]))
+            if b["end"] < seg_end:
+                rest.append((b["end"], seg_end))
+        segments = rest
+    return merged, segments
+
+
+def cleaning_remedy_plan(conn, live, target_id, duration):
+    """为目标批次构造“补一条清洁”的补救试算方案（不写入任何数据）。
+
+    逐台处理目标因清洁受阻的器具：取当前排程中该器具上“前一已排入批次结束 →
+    目标开始”的区间，按现有停用与占用扣除后找能容纳 duration 分钟的最晚
+    连续时窗；建议清洁覆盖该器具全部新增残留过敏原，清洁完成时间取时窗末端，
+    有效期恰好覆盖目标开始。任一相关器具无足够时窗，或目标还因占用 / 停用等
+    原因受阻时，用全部可行时窗生成虚拟清洁重算完整排程——目标仍阻塞则不可解。
+    返回方案字典（error 非 None 时表示输入被拒绝）。
+    """
+    target = next((r for r in live if r["id"] == target_id), None)
+    if target is None:
+        return {"error": f"批次 #{target_id} 不存在或已删除，无法试算"}
+    cleaning_risks = [risk for risk in target["risks"]
+                      if risk["level"] == "blocked"]
+    if target["status"] != "blocked" or not cleaning_risks:
+        return {"error": f"批次「{target['name']}」当前并非因清洁缺失 / 失效 /"
+                         f" 覆盖不足受阻，无需清洁补救试算"}
+
+    start = target["start"]
+    other_blocks = [reason for reason in target["blocks"]
+                    if reason not in {risk["block_reason"]
+                                      for risk in cleaning_risks}]
+    downtimes = active_downtimes(conn)
+    usage = accepted_usage(conn, live)
+
+    plans, virtual_cleanings = [], []
+    for risk in cleaning_risks:
+        eq_id = risk["equipment_id"]
+        horizon_start, horizon_end = risk["prev_end"], start
+        blockers, segments = free_segments_between(
+            horizon_start, horizon_end,
+            downtimes.get(eq_id, []), usage.get(eq_id, []))
+        # 最晚时窗：从最靠后的空闲段开始选，时窗末端贴齐该段末端
+        window_start = window_end = None
+        for seg_start, seg_end in reversed(segments):
+            if seg_end - seg_start >= timedelta(minutes=duration):
+                window_end = seg_end
+                window_start = seg_end - timedelta(minutes=duration)
+                break
+        plan = {
+            "equipment_id": eq_id,
+            "equipment": risk["equipment"],
+            "from_batch": risk["from_batch"],
+            "new_risks": risk["new_risks"],
+            "covers": ",".join(risk["new_risks"]),
+            "block_reason": risk["block_reason"],
+            "horizon_start": horizon_start, "horizon_end": horizon_end,
+            "horizon_start_text": fmt_dt_min(horizon_start),
+            "horizon_end_text": fmt_dt_min(horizon_end),
+            "blockers": blockers,
+            "segments": [{"start": s, "end": e,
+                          "start_text": fmt_dt_min(s),
+                          "end_text": fmt_dt_min(e),
+                          "minutes": int((e - s).total_seconds() // 60)}
+                         for s, e in segments],
+            "feasible": window_start is not None,
+            "window_start": window_start, "window_end": window_end,
+            "window_start_text": fmt_dt_min(window_start),
+            "window_end_text": fmt_dt_min(window_end),
+        }
+        if not plan["feasible"]:
+            longest = max((int((e - s).total_seconds() // 60)
+                           for s, e in segments), default=0)
+            reason = (f"前一已排入批次结束（{plan['horizon_start_text']}）至"
+                      f"目标开始（{plan['horizon_end_text']}）之间最长连续空闲"
+                      f"仅 {longest} 分钟，不足清洁所需 {duration} 分钟")
+            if blockers:
+                reason += "（区间内存在：" + "；".join(
+                    b["label"] for b in blockers) + "）"
+            plan["reason"] = reason
+        else:
+            plan["reason"] = (
+                f"可在 {plan['window_start_text']} ~ {plan['window_end_text']}"
+                f" 连续执行 {duration} 分钟清洁（最晚可用时窗），"
+                f"完成时间 {plan['window_end_text']} 作为清洁时间，"
+                f"有效期覆盖至目标开始 {plan['horizon_end_text']}")
+            virtual_cleanings.append({
+                "equipment_id": eq_id,
+                "cleaned_at": window_end.isoformat(timespec="minutes"),
+                "valid_until": start.isoformat(timespec="minutes"),
+                "covers": plan["covers"], "virtual": True, "id": None,
+            })
+        plans.append(plan)
+
+    trial = compute_schedule(conn, virtual_cleanings=virtual_cleanings)
+    target_after = next(r for r in trial if r["id"] == target_id)
+    solvable = target_after["status"] == "accepted"
+    infeasible = [p for p in plans if not p["feasible"]]
+    if solvable:
+        verdict = ("仅靠补登清洁即可解决：按下表最晚时窗为每台相关器具补一条"
+                   "清洁后，目标批次可排入（仍需在「器具与清洁」正式登记后才会"
+                   "写入实时排程；本试算不写入任何数据）")
+    else:
+        reasons = []
+        if infeasible:
+            reasons.append("相关器具无足够连续清洁时窗："
+                           + "；".join(f"「{p['equipment']}」{p['reason']}"
+                                       for p in infeasible))
+        if other_blocks:
+            reasons.append("目标批次还存在非清洁阻塞：" + "；".join(other_blocks))
+        if target_after["status"] != "accepted" and target_after["blocks"]:
+            new_reasons = [b for b in target_after["blocks"]
+                           if b not in target["blocks"]]
+            if new_reasons:
+                reasons.append("加入虚拟清洁重算后目标仍受阻："
+                               + "；".join(new_reasons))
+            elif not reasons:
+                reasons.append("加入虚拟清洁重算后目标仍受阻："
+                               + "；".join(target_after["blocks"]))
+        verdict = "不可仅靠清洁解决——" + "；".join(reasons)
+    return {"error": None, "target": target, "target_after": target_after,
+            "duration": duration, "plans": plans,
+            "other_blocks": other_blocks,
+            "virtual_cleanings": virtual_cleanings,
+            "trial": trial, "live": live, "solvable": solvable,
+            "verdict": verdict}
+
+
+def remedy_form_context(conn, prefill=None):
+    """清洁补救试算表单所需数据：当前排程与清洁类受阻候选批次。"""
+    live = compute_schedule(conn)
+    targets = cleaning_blocked_targets(live)
+    selected = (prefill or {}).get("target_id", "")
+    duration = (prefill or {}).get("duration", "")
+    return {"live": live, "targets": targets,
+            "selected": selected, "duration_value": duration}
+
+
+@app.route("/cleaning-remedy")
+def cleaning_remedy_page():
+    return render_template("cleaning_remedy.html",
+                           **remedy_form_context(get_db()))
+
+
+@app.post("/cleaning-remedy/preview")
+def cleaning_remedy_preview():
+    """清洁补救试算：选择清洁类受阻批次并输入正整数分钟数，查看补清洁的效果。
+
+    无效批次（不存在 / 当前并非清洁受阻）与非正整数时长一律拒绝；
+    试算只用虚拟清洁在内存中重算完整排程，不写入清洁记录、实时排程或交接版。
+    """
+    conn = get_db()
+    live = compute_schedule(conn)
+    targets = cleaning_blocked_targets(live)
+    raw_target = (request.form.get("target_id", "") or "").strip()
+    raw_duration = (request.form.get("duration", "") or "").strip()
+    try:
+        target_id = int(raw_target)
+    except ValueError:
+        target_id = None
+    try:
+        duration = int(raw_duration)
+    except ValueError:
+        duration = None
+    if target_id is None:
+        flash("试算被拒绝：请选择一个有效的批次", "error")
+        return render_template(
+            "cleaning_remedy.html",
+            **remedy_form_context(conn, prefill=request.form)), 400
+    if duration is None:
+        flash("试算被拒绝：清洁时长必须为正整数分钟数（如 15、30），"
+              "未改动任何数据", "error")
+        return render_template(
+            "cleaning_remedy.html",
+            **remedy_form_context(conn, prefill=request.form)), 400
+    if duration <= 0:
+        flash("试算被拒绝：清洁时长必须为正整数（大于 0 的分钟数），"
+              "未改动任何数据", "error")
+        return render_template(
+            "cleaning_remedy.html",
+            **remedy_form_context(conn, prefill=request.form)), 400
+    if target_id not in targets:
+        flash(f"试算被拒绝：批次 #{target_id} 不存在，或当前并非因清洁缺失 /"
+              f" 失效 / 覆盖不足受阻；仅可选择列表中因清洁问题受阻的批次，"
+              f"未改动任何数据", "error")
+        return render_template(
+            "cleaning_remedy.html",
+            **remedy_form_context(conn, prefill=request.form)), 400
+    plan = cleaning_remedy_plan(conn, live, target_id, duration)
+    if plan.get("error"):
+        flash(f"试算被拒绝：{plan['error']}；未改动任何数据", "error")
+        return render_template(
+            "cleaning_remedy.html",
+            **remedy_form_context(conn, prefill=request.form)), 400
+    live_by_id = {r["id"]: r for r in live}
+    rows = []
+    for i, t in enumerate(plan["trial"], 1):
+        b = live_by_id[t["id"]]
+        changes = []
+        if b["status"] != t["status"]:
+            changes.append(f"状态：{'已排入' if b['status'] == 'accepted' else '已拒绝'}"
+                           f" → {'已排入' if t['status'] == 'accepted' else '已拒绝'}")
+        if b["blocks"] != t["blocks"]:
+            changes.append("阻塞原因 / 风险处置发生变化")
+        rows.append({"before": b, "after": t, "changes": changes,
+                     "is_target": t["id"] == target_id,
+                     "position": i})
+    accepted = sum(1 for r in plan["trial"] if r["status"] == "accepted")
+    return render_template(
+        "cleaning_remedy_preview.html", plan=plan, rows=rows,
+        trial_accepted=accepted, trial_blocked=len(plan["trial"]) - accepted,
+        target_id=target_id, duration=duration)
 
 
 # ---------------------------------------------------------------- 导出
